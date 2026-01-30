@@ -1,6 +1,6 @@
 # Memory Usage Badges
 
-GNOME Shell extension that displays RAM usage badges on app icons in the Dash and Overview.
+GNOME Shell extension that displays RAM usage badges on Dash app icons.
 
 ## Screenshots
 
@@ -12,7 +12,7 @@ GNOME Shell extension that displays RAM usage badges on app icons in the Dash an
 
 ## Features
 
-- Shows memory usage as compact badges above app icons
+- Shows memory usage as compact badges on Dash app icons
 - Aggregates memory across all related processes using cgroup detection
 - Color-coded: black for normal usage, red for high memory (≥ 2 GB)
 - Updates every 2.5 seconds
@@ -20,24 +20,32 @@ GNOME Shell extension that displays RAM usage badges on app icons in the Dash an
 
 ## Compatibility
 
-GNOME Shell 47+
-
-Note: Extension shows badges on all app icons created with AppDisplay.AppIcon, including Dash, Overview app grid, and search results.
+GNOME Shell 45, 46, 47, 48
 
 ## Installation
 
+### From Source
+
 ```bash
 cd ~/.local/share/gnome-shell/extensions/
-cp -r /path/to/overview-app-memory@gnome-shell-extensions .
+git clone https://github.com/mohamedahmed-dev/memory-usage-badges.git memory-usage-badges@mohamed
+```
+
+Or download and extract:
+
+```bash
+cd ~/.local/share/gnome-shell/extensions/
+cp -r /path/to/memory-usage-badges memory-usage-badges@mohamed
 ```
 
 Then restart GNOME Shell:
-- X11: `Alt+F2`, type `r`, press Enter
-- Wayland: Log out and log back in
+- **X11:** Press `Alt+F2`, type `r`, press Enter
+- **Wayland:** Log out and log back in
 
 Enable the extension:
+
 ```bash
-gnome-extensions enable overview-app-memory@gnome-shell-extensions
+gnome-extensions enable memory-usage-badges@mohamed
 ```
 
 ## Technical Details
@@ -62,8 +70,12 @@ journalctl -f -o cat /usr/bin/gnome-shell
 
 Verify extension is enabled:
 ```bash
-gnome-extensions list --enabled | grep overview-app-memory
+gnome-extensions list --enabled | grep memory-usage-badges
 ```
+
+## Contributing
+
+Issues and pull requests are welcome at [github.com/mohamedahmed-dev/memory-usage-badges](https://github.com/mohamedahmed-dev/memory-usage-badges)
 
 ## License
 
