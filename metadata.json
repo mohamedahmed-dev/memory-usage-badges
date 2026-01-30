@@ -1,0 +1,9 @@
+{
+  "name": "Memory Usage Badges",
+  "description": "Shows RAM usage as badges on application icons in the Dash and Overview.\n\nMemory is aggregated across all related processes using cgroup-based detection. Badges are color-coded: black for normal usage, red for high memory (≥ 2 GB).\n\nUpdates every 2.5 seconds with minimal performance overhead.",
+  "uuid": "overview-app-memory@gnome-shell-extensions",
+  "shell-version": [
+    "47"
+  ],
+  "url": "https://github.com/mohamedahmed-dev/memory-usage-badges"
+}
