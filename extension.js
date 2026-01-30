@@ -257,7 +257,7 @@ export default class OverviewAppMemoryExtension extends Extension {
     _cleanupBadges() {
         for (let [icon, badge] of this._memoryBadges.entries()) {
             try {
-                if (badge && !badge.is_finalized()) {
+                if (badge && !badge.is_finalized) {
                     icon.remove_child(badge);
                     badge.destroy();
                 }
@@ -309,7 +309,7 @@ function _attachMemoryBadge(icon, memoryBadges) {
         if (memoryBadges.has(icon)) {
             const badgeToRemove = memoryBadges.get(icon);
             memoryBadges.delete(icon);
-            if (badgeToRemove && !badgeToRemove.is_finalized()) {
+            if (badgeToRemove && !badgeToRemove.is_finalized) {
                 if (badgeToRemove._allocationSignalId) {
                     badgeToRemove.disconnect(badgeToRemove._allocationSignalId);
                     badgeToRemove._allocationSignalId = null;
