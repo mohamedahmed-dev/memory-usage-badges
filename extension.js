@@ -11,9 +11,13 @@ const UPDATE_INTERVAL_MS = 5000; // Changed from 2500 to 5000 (5 seconds)
 const MEMORY_THRESHOLD_RED_MB = 2048;
 
 // Cache for process relationships to avoid rescanning /proc every time
-const PROCESS_CACHE_DURATION_MS = 10000; // Cache for 10 seconds
+const PROCESS_CACHE_DURATION_MS = 20000; // Cache for 20 seconds (increased from 10s)
 let processCache = new Map();
 let processCacheTime = 0;
+
+// Limits to spread work across frames
+const MAX_PROCESSES_PER_IDLE = 10; // Process max 10 processes per idle callback
+const MAX_APPS_PER_FRAME = 3; // Update max 3 apps per frame
 
 function getProcessCgroup(pid) {
     try {
@@ -98,7 +102,6 @@ function getRelatedProcesses(basePids) {
         const procDir = GLib.Dir.open('/proc', 0);
         let name;
         let processCount = 0;
-        const MAX_PROCESSES_PER_BATCH = 50; // Limit batch size
 
         while ((name = procDir.read_name()) !== null) {
             if (!/^\d+$/.test(name)) continue;
@@ -109,10 +112,9 @@ function getRelatedProcesses(basePids) {
             processedPids.add(pid);
             processCount++;
 
-            // Yield to main loop periodically to avoid freezing
-            if (processCount % MAX_PROCESSES_PER_BATCH === 0) {
-                // Skip further processing in this batch - we'll catch it next time
-                continue;
+            // Hard limit: stop scanning after checking enough processes
+            if (processCount >= 100) {
+                break;
             }
 
             let isRelated = false;
@@ -242,6 +244,8 @@ export default class OverviewAppMemoryExtension extends Extension {
         this._updateTimeoutId = null;
         this._originalAppIconInit = null;
         this._isUpdating = false;
+        this._updateQueue = [];
+        this._updateQueueProcessing = false;
     }
 
     enable() {
@@ -257,6 +261,8 @@ export default class OverviewAppMemoryExtension extends Extension {
         this._memoryBadges = null;
         this._updateTimeoutId = null;
         this._originalAppIconInit = null;
+        this._updateQueue = [];
+        this._updateQueueProcessing = false;
         
         // Clear caches on disable
         processCache.clear();
@@ -309,13 +315,72 @@ export default class OverviewAppMemoryExtension extends Extension {
         
         this._isUpdating = true;
         
-        // Use idle callback to spread work and not block UI
+        // Build queue of apps to update
+        const appSystem = Shell.AppSystem.get_default();
+        const runningApps = appSystem.get_running();
+        this._updateQueue = Array.from(runningApps);
+        this._updateQueueProcessing = false;
+        
+        // Start processing queue in chunks
+        this._processUpdateQueue();
+    }
+
+    _processUpdateQueue() {
+        if (this._updateQueue.length === 0) {
+            this._isUpdating = false;
+            this._updateQueueProcessing = false;
+            return;
+        }
+
+        this._updateQueueProcessing = true;
+
+        // Process small batch of apps per frame
         GLib.idle_add(GLib.PRIORITY_LOW, () => {
-            try {
-                _updateMemoryBadges(this._memoryBadges);
-            } finally {
-                this._isUpdating = false;
+            const batch = this._updateQueue.splice(0, MAX_APPS_PER_FRAME);
+            const appMemoryMap = new Map();
+
+            // Calculate memory for this batch
+            for (let app of batch) {
+                const memoryKB = getAppMemory(app);
+                appMemoryMap.set(app, memoryKB);
             }
+
+            // Update badges for this batch
+            for (let [icon, badge] of this._memoryBadges.entries()) {
+                try {
+                    const app = icon.app;
+                    if (!app || !appMemoryMap.has(app)) {
+                        continue;
+                    }
+
+                    const memoryKB = appMemoryMap.get(app);
+                    const formattedMemory = formatMemoryCompact(memoryKB);
+
+                    if (formattedMemory) {
+                        badge.text = formattedMemory;
+                        badge.remove_style_class_name('memory-high');
+
+                        if (isHighMemory(memoryKB)) {
+                            badge.add_style_class_name('memory-high');
+                        }
+
+                        badge.show();
+                    } else {
+                        badge.hide();
+                    }
+                } catch (e) {
+                    badge.hide();
+                }
+            }
+
+            // Schedule next batch
+            if (this._updateQueue.length > 0) {
+                this._processUpdateQueue();
+            } else {
+                this._isUpdating = false;
+                this._updateQueueProcessing = false;
+            }
+
             return GLib.SOURCE_REMOVE;
         });
     }
@@ -396,41 +461,3 @@ function _attachMemoryBadge(icon, memoryBadges) {
     });
 }
 
-function _updateMemoryBadges(memoryBadges) {
-    const appSystem = Shell.AppSystem.get_default();
-    const runningApps = appSystem.get_running();
-    const appMemoryMap = new Map();
-
-    for (let app of runningApps) {
-        const memoryKB = getAppMemory(app);
-        appMemoryMap.set(app, memoryKB);
-    }
-
-    for (let [icon, badge] of memoryBadges.entries()) {
-        try {
-            const app = icon.app;
-            if (!app) {
-                badge.hide();
-                continue;
-            }
-
-            const memoryKB = appMemoryMap.get(app) || 0;
-            const formattedMemory = formatMemoryCompact(memoryKB);
-
-            if (formattedMemory) {
-                badge.text = formattedMemory;
-                badge.remove_style_class_name('memory-high');
-
-                if (isHighMemory(memoryKB)) {
-                    badge.add_style_class_name('memory-high');
-                }
-
-                badge.show();
-            } else {
-                badge.hide();
-            }
-        } catch (e) {
-            badge.hide();
-        }
-    }
-}
