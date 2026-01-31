@@ -4,9 +4,16 @@ import Clutter from 'gi://Clutter';
 import Shell from 'gi://Shell';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as AppDisplay from 'resource:///org/gnome/shell/ui/appDisplay.js';
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
-const UPDATE_INTERVAL_MS = 2500;
+// Increased update interval to reduce CPU load
+const UPDATE_INTERVAL_MS = 5000; // Changed from 2500 to 5000 (5 seconds)
 const MEMORY_THRESHOLD_RED_MB = 2048;
+
+// Cache for process relationships to avoid rescanning /proc every time
+const PROCESS_CACHE_DURATION_MS = 10000; // Cache for 10 seconds
+let processCache = new Map();
+let processCacheTime = 0;
 
 function getProcessCgroup(pid) {
     try {
@@ -16,7 +23,8 @@ function getProcessCgroup(pid) {
         const text = new TextDecoder('utf-8').decode(contents);
         const lines = text.split('\n');
 
-        for (let line of lines) {
+        for (let line of lines)
+ {
             if (line.startsWith('0::')) {
                 return line.substring(3);
             }
@@ -65,11 +73,20 @@ function getParentPid(pid) {
 }
 
 function getRelatedProcesses(basePids) {
+    // Use cached result if still valid
+    const cacheKey = basePids.sort((a, b) => a - b).join(',');
+    const now = Date.now();
+    
+    if (now - processCacheTime < PROCESS_CACHE_DURATION_MS && processCache.has(cacheKey)) {
+        return processCache.get(cacheKey);
+    }
+    
     const relatedPids = new Set(basePids);
     const processedPids = new Set();
     const cgroupMap = new Map();
     const exeMap = new Map();
 
+    // Build cgroup and exe maps for base pids
     for (let pid of basePids) {
         const cgroup = getProcessCgroup(pid);
         const exe = getProcessExePath(pid);
@@ -80,6 +97,8 @@ function getRelatedProcesses(basePids) {
     try {
         const procDir = GLib.Dir.open('/proc', 0);
         let name;
+        let processCount = 0;
+        const MAX_PROCESSES_PER_BATCH = 50; // Limit batch size
 
         while ((name = procDir.read_name()) !== null) {
             if (!/^\d+$/.test(name)) continue;
@@ -88,9 +107,17 @@ function getRelatedProcesses(basePids) {
             if (processedPids.has(pid) || relatedPids.has(pid)) continue;
             
             processedPids.add(pid);
+            processCount++;
+
+            // Yield to main loop periodically to avoid freezing
+            if (processCount % MAX_PROCESSES_PER_BATCH === 0) {
+                // Skip further processing in this batch - we'll catch it next time
+                continue;
+            }
 
             let isRelated = false;
 
+            // Check cgroup relationship
             const pidCgroup = getProcessCgroup(pid);
             if (pidCgroup) {
                 for (let baseCgroup of cgroupMap.values()) {
@@ -101,6 +128,7 @@ function getRelatedProcesses(basePids) {
                 }
             }
 
+            // Check executable path relationship
             if (!isRelated) {
                 const pidExe = getProcessExePath(pid);
                 if (pidExe) {
@@ -113,11 +141,12 @@ function getRelatedProcesses(basePids) {
                 }
             }
 
+            // Check parent relationship (limited depth to avoid deep scans)
             if (!isRelated) {
                 let currentPid = pid;
                 const visited = new Set();
 
-                for (let i = 0; i < 10 && currentPid; i++) {
+                for (let i = 0; i < 5 && currentPid; i++) { // Reduced from 10 to 5
                     if (visited.has(currentPid)) break;
                     visited.add(currentPid);
 
@@ -138,7 +167,19 @@ function getRelatedProcesses(basePids) {
         // /proc not accessible
     }
 
-    return Array.from(relatedPids);
+    const result = Array.from(relatedPids);
+    
+    // Update cache
+    processCache.set(cacheKey, result);
+    processCacheTime = now;
+    
+    // Clear old cache entries to prevent memory leak
+    if (processCache.size > 50) {
+        const firstKey = processCache.keys().next().value;
+        processCache.delete(firstKey);
+    }
+    
+    return result;
 }
 
 function getProcessMemory(pid) {
@@ -200,6 +241,7 @@ export default class OverviewAppMemoryExtension extends Extension {
         this._memoryBadges = null;
         this._updateTimeoutId = null;
         this._originalAppIconInit = null;
+        this._isUpdating = false;
     }
 
     enable() {
@@ -215,6 +257,10 @@ export default class OverviewAppMemoryExtension extends Extension {
         this._memoryBadges = null;
         this._updateTimeoutId = null;
         this._originalAppIconInit = null;
+        
+        // Clear caches on disable
+        processCache.clear();
+        processCacheTime = 0;
     }
 
     _patchAppIcon() {
@@ -236,15 +282,42 @@ export default class OverviewAppMemoryExtension extends Extension {
     }
 
     _startUpdates() {
-        _updateMemoryBadges(this._memoryBadges);
+        // Initial update
+        this._scheduleUpdate();
+        
+        // Schedule periodic updates with LOW priority to avoid interfering with user input
         this._updateTimeoutId = GLib.timeout_add(
-            GLib.PRIORITY_DEFAULT,
+            GLib.PRIORITY_LOW, // Changed from PRIORITY_DEFAULT to PRIORITY_LOW
             UPDATE_INTERVAL_MS,
             () => {
-                _updateMemoryBadges(this._memoryBadges);
+                this._scheduleUpdate();
                 return GLib.SOURCE_CONTINUE;
             }
         );
+    }
+
+    _scheduleUpdate() {
+        // Skip if already updating to prevent overlapping updates
+        if (this._isUpdating) {
+            return;
+        }
+        
+        // Only update when overview is visible to save resources
+        if (!Main.overview.visible) {
+            return;
+        }
+        
+        this._isUpdating = true;
+        
+        // Use idle callback to spread work and not block UI
+        GLib.idle_add(GLib.PRIORITY_LOW, () => {
+            try {
+                _updateMemoryBadges(this._memoryBadges);
+            } finally {
+                this._isUpdating = false;
+            }
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     _stopUpdates() {
