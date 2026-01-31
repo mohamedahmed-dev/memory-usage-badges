@@ -63,7 +63,7 @@ function getParentPid(pid) {
 
         const text = new TextDecoder('utf-8').decode(contents);
         const parts = text.split(')');
-        
+
         if (parts.length > 1) {
             const fields = parts[1].trim().split(/\s+/);
             const ppid = parseInt(fields[1], 10);
@@ -80,11 +80,11 @@ function getRelatedProcesses(basePids) {
     // Use cached result if still valid
     const cacheKey = basePids.sort((a, b) => a - b).join(',');
     const now = Date.now();
-    
+
     if (now - processCacheTime < PROCESS_CACHE_DURATION_MS && processCache.has(cacheKey)) {
         return processCache.get(cacheKey);
     }
-    
+
     const relatedPids = new Set(basePids);
     const processedPids = new Set();
     const cgroupMap = new Map();
@@ -108,7 +108,7 @@ function getRelatedProcesses(basePids) {
 
             const pid = parseInt(name, 10);
             if (processedPids.has(pid) || relatedPids.has(pid)) continue;
-            
+
             processedPids.add(pid);
             processCount++;
 
@@ -170,17 +170,17 @@ function getRelatedProcesses(basePids) {
     }
 
     const result = Array.from(relatedPids);
-    
+
     // Update cache
     processCache.set(cacheKey, result);
     processCacheTime = now;
-    
+
     // Clear old cache entries to prevent memory leak
     if (processCache.size > 50) {
         const firstKey = processCache.keys().next().value;
         processCache.delete(firstKey);
     }
-    
+
     return result;
 }
 
@@ -246,6 +246,7 @@ export default class OverviewAppMemoryExtension extends Extension {
         this._isUpdating = false;
         this._updateQueue = [];
         this._updateQueueProcessing = false;
+        this._appMemoryCache = new Map();
     }
 
     enable() {
@@ -263,7 +264,8 @@ export default class OverviewAppMemoryExtension extends Extension {
         this._originalAppIconInit = null;
         this._updateQueue = [];
         this._updateQueueProcessing = false;
-        
+        this._appMemoryCache = null;
+
         // Clear caches on disable
         processCache.clear();
         processCacheTime = 0;
@@ -290,7 +292,7 @@ export default class OverviewAppMemoryExtension extends Extension {
     _startUpdates() {
         // Initial update
         this._scheduleUpdate();
-        
+
         // Schedule periodic updates with LOW priority to avoid interfering with user input
         this._updateTimeoutId = GLib.timeout_add(
             GLib.PRIORITY_LOW, // Changed from PRIORITY_DEFAULT to PRIORITY_LOW
@@ -307,19 +309,20 @@ export default class OverviewAppMemoryExtension extends Extension {
         if (this._isUpdating) {
             return;
         }
-        
+
         // Only update when overview is visible to save resources
         if (!Main.overview.visible) {
             return;
         }
-        
+
         this._isUpdating = true;
-        
+
         // Build queue of apps to update
         const appSystem = Shell.AppSystem.get_default();
         const runningApps = appSystem.get_running();
         this._updateQueue = Array.from(runningApps);
         this._updateQueueProcessing = false;
+this._appMemoryCache.clear();
         
         // Start processing queue in chunks
         this._processUpdateQueue();
@@ -327,6 +330,8 @@ export default class OverviewAppMemoryExtension extends Extension {
 
     _processUpdateQueue() {
         if (this._updateQueue.length === 0) {
+            // All apps processed, now update all badges
+            this._updateAllBadges();
             this._isUpdating = false;
             this._updateQueueProcessing = false;
             return;
@@ -337,52 +342,55 @@ export default class OverviewAppMemoryExtension extends Extension {
         // Process small batch of apps per frame
         GLib.idle_add(GLib.PRIORITY_LOW, () => {
             const batch = this._updateQueue.splice(0, MAX_APPS_PER_FRAME);
-            const appMemoryMap = new Map();
 
-            // Calculate memory for this batch
+            // Calculate memory for this batch and store in cache
             for (let app of batch) {
                 const memoryKB = getAppMemory(app);
-                appMemoryMap.set(app, memoryKB);
-            }
-
-            // Update badges for this batch
-            for (let [icon, badge] of this._memoryBadges.entries()) {
-                try {
-                    const app = icon.app;
-                    if (!app || !appMemoryMap.has(app)) {
-                        continue;
-                    }
-
-                    const memoryKB = appMemoryMap.get(app);
-                    const formattedMemory = formatMemoryCompact(memoryKB);
-
-                    if (formattedMemory) {
-                        badge.text = formattedMemory;
-                        badge.remove_style_class_name('memory-high');
-
-                        if (isHighMemory(memoryKB)) {
-                            badge.add_style_class_name('memory-high');
-                        }
-
-                        badge.show();
-                    } else {
-                        badge.hide();
-                    }
-                } catch (e) {
-                    badge.hide();
-                }
+                this._appMemoryCache.set(app, memoryKB);
             }
 
             // Schedule next batch
             if (this._updateQueue.length > 0) {
                 this._processUpdateQueue();
             } else {
+                // All apps processed, now update all badges
+                this._updateAllBadges();
                 this._isUpdating = false;
                 this._updateQueueProcessing = false;
             }
 
             return GLib.SOURCE_REMOVE;
         });
+    }
+
+    _updateAllBadges() {
+        for (let [icon, badge] of this._memoryBadges.entries()) {
+            try {
+                const app = icon.app;
+                if (!app) {
+                    badge.hide();
+                    continue;
+                }
+
+                const memoryKB = this._appMemoryCache.get(app) || 0;
+                const formattedMemory = formatMemoryCompact(memoryKB);
+
+                if (formattedMemory) {
+                    badge.text = formattedMemory;
+                    badge.remove_style_class_name('memory-high');
+
+                    if (isHighMemory(memoryKB)) {
+                        badge.add_style_class_name('memory-high');
+                    }
+
+                    badge.show();
+                } else {
+                    badge.hide();
+                }
+            } catch (e) {
+                badge.hide();
+            }
+        }
     }
 
     _stopUpdates() {
@@ -460,4 +468,3 @@ function _attachMemoryBadge(icon, memoryBadges) {
         }
     });
 }
-
