@@ -6,27 +6,103 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as AppDisplay from 'resource:///org/gnome/shell/ui/appDisplay.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
-// Increased update interval to reduce CPU load
-const UPDATE_INTERVAL_MS = 5000; // Changed from 2500 to 5000 (5 seconds)
+// Fast update interval for responsive display
+const UPDATE_INTERVAL_MS = 500; // 500ms for quick badge updates
 const MEMORY_THRESHOLD_RED_MB = 2048;
 
-// Cache for process matching to avoid rescanning /proc every time
-const PROCESS_CACHE_DURATION_MS = 20000; // Cache for 20 seconds (increased from 10s)
-let processCache = new Map();
-let processCacheTime = 0;
+// Short cache for accurate real-time process discovery
+const PROCESS_CACHE_DURATION_MS = 250; // Cache for 250ms for real-time accuracy
+let processCache = new Map(); // appId -> {pids: [], timestamp: number}
 
 // Limits to spread work across frames
 const MAX_PROCESSES_PER_IDLE = 10; // Process max 10 processes per idle callback
-const MAX_APPS_PER_FRAME = 3; // Update max 3 apps per frame
+const MAX_APPS_PER_FRAME = 10; // Update max 10 apps per frame for responsive updates
 
-function getProcessCmdline(pid) {
+function getProcessCgroup(pid) {
     try {
-        const [success, contents] = GLib.file_get_contents(`/proc/${pid}/cmdline`);
+        const [success, contents] = GLib.file_get_contents(`/proc/${pid}/cgroup`);
         if (!success) return null;
 
-        // cmdline is null-separated, replace with spaces
         const text = new TextDecoder('utf-8').decode(contents);
-        return text.replace(/\0/g, ' ').trim();
+        const lines = text.split('\n');
+
+        for (let line of lines) {
+            if (line.startsWith('0::')) {
+                return line.substring(3);
+            }
+        }
+
+        if (lines.length > 0 && lines[0].includes(':')) {
+            const parts = lines[0].split(':');
+            if (parts.length >= 3) return parts[2];
+        }
+
+        return null;
+    } catch (e) {
+        return null;
+    }
+}
+
+function getParentPid(pid) {
+    try {
+        const [success, contents] = GLib.file_get_contents(`/proc/${pid}/stat`);
+        if (!success) return null;
+
+        const text = new TextDecoder('utf-8').decode(contents);
+        const parts = text.split(')');
+
+        if (parts.length > 1) {
+            const fields = parts[1].trim().split(/\s+/);
+            const ppid = parseInt(fields[1], 10);
+            return ppid > 0 ? ppid : null;
+        }
+
+        return null;
+    } catch (e) {
+        return null;
+    }
+}
+
+function getProcessCgroup(pid) {
+    try {
+        const [success, contents] = GLib.file_get_contents(`/proc/${pid}/cgroup`);
+        if (!success) return null;
+
+        const text = new TextDecoder('utf-8').decode(contents);
+        const lines = text.split('\n');
+
+        for (let line of lines) {
+            if (line.startsWith('0::')) {
+                return line.substring(3);
+            }
+        }
+
+        if (lines.length > 0 && lines[0].includes(':')) {
+            const parts = lines[0].split(':');
+            if (parts.length >= 3) return parts[2];
+        }
+
+        return null;
+    } catch (e) {
+        return null;
+    }
+}
+
+function getParentPid(pid) {
+    try {
+        const [success, contents] = GLib.file_get_contents(`/proc/${pid}/stat`);
+        if (!success) return null;
+
+        const text = new TextDecoder('utf-8').decode(contents);
+        const parts = text.split(')');
+
+        if (parts.length > 1) {
+            const fields = parts[1].trim().split(/\s+/);
+            const ppid = parseInt(fields[1], 10);
+            return ppid > 0 ? ppid : null;
+        }
+
+        return null;
     } catch (e) {
         return null;
     }
@@ -43,86 +119,169 @@ function getProcessExePath(pid) {
     }
 }
 
-function getAppMatchingProcesses(app) {
+function getAppRelatedProcesses(app) {
     const basePids = app.get_pids();
     if (basePids.length === 0) return [];
 
-    // Try to get app ID for caching
     const appId = app.get_id();
     const now = Date.now();
 
-    // Check cache
-    if (now - processCacheTime < PROCESS_CACHE_DURATION_MS && processCache.has(appId)) {
-        return processCache.get(appId);
+    // Check cache (per-app timestamp)
+    if (processCache.has(appId)) {
+        const cached = processCache.get(appId);
+        if (now - cached.timestamp < PROCESS_CACHE_DURATION_MS) {
+            return cached.pids;
+        }
     }
 
-    // Get executable name from first base PID
-    const baseExe = getProcessExePath(basePids[0]);
-    if (!baseExe) return basePids;
-
-    // Extract executable name (e.g., "librewolf" from "/usr/bin/librewolf")
-    const exeName = baseExe.split('/').pop();
-
-    const matchingPids = new Set();
+    const relatedPids = new Set(basePids);
+    
+    // Build initial cgroup and exe sets from base processes
+    const baseCgroups = new Set();
+    const baseExePaths = new Set();
+    
+    for (let pid of basePids) {
+        const cgroup = getProcessCgroup(pid);
+        const exe = getProcessExePath(pid);
+        if (cgroup) baseCgroups.add(cgroup);
+        if (exe) baseExePaths.add(exe);
+    }
 
     try {
+        // First pass: Build complete process information map
         const procDir = GLib.Dir.open('/proc', 0);
         let name;
-        let processCount = 0;
+        const processInfo = new Map(); // pid -> {cgroup, exe, ppid}
 
         while ((name = procDir.read_name()) !== null) {
             if (!/^\d+$/.test(name)) continue;
-
             const pid = parseInt(name, 10);
-            processCount++;
+            
+            const cgroup = getProcessCgroup(pid);
+            const exe = getProcessExePath(pid);
+            const ppid = getParentPid(pid);
+            
+            processInfo.set(pid, {cgroup, exe, ppid});
+        }
 
-            // Hard limit to prevent scanning too many processes
-            if (processCount >= 500) break;
+        // Second pass: Multi-pass matching
+        let foundNew = true;
+        let passes = 0;
+        const maxPasses = 10;
+        
+        while (foundNew && passes < maxPasses) {
+            foundNew = false;
+            passes++;
 
-            // Check executable path
-            const pidExe = getProcessExePath(pid);
-            if (pidExe) {
-                const pidExeName = pidExe.split('/').pop();
-                if (pidExeName === exeName || pidExe.includes(exeName)) {
-                    matchingPids.add(pid);
-                    continue;
+            for (let [pid, info] of processInfo.entries()) {
+                if (relatedPids.has(pid)) continue;
+                
+                let isRelated = false;
+
+                // Strategy 1: Cgroup matching
+                if (!isRelated && baseCgroups.size > 0 && info.cgroup) {
+                    for (let baseCgroup of baseCgroups) {
+                        if (info.cgroup === baseCgroup || info.cgroup.startsWith(baseCgroup + '/')) {
+                            isRelated = true;
+                            break;
+                        }
+                    }
                 }
-            }
 
-            // Check command line
-            const cmdline = getProcessCmdline(pid);
-            if (cmdline && cmdline.includes(exeName)) {
-                matchingPids.add(pid);
+                // Strategy 2: Exact executable path matching
+                if (!isRelated && baseExePaths.size > 0 && info.exe) {
+                    if (baseExePaths.has(info.exe)) {
+                        isRelated = true;
+                    }
+                }
+
+                // Strategy 3: Parent-child relationship traversal
+                if (!isRelated && info.ppid) {
+                    let currentPid = info.ppid;
+                    const visited = new Set();
+                    let depth = 0;
+
+                    while (currentPid && depth < 10) {
+                        if (visited.has(currentPid)) break;
+                        visited.add(currentPid);
+
+                        if (relatedPids.has(currentPid)) {
+                            isRelated = true;
+                            break;
+                        }
+
+                        const ancestorInfo = processInfo.get(currentPid);
+                        if (!ancestorInfo || !ancestorInfo.ppid) break;
+                        
+                        currentPid = ancestorInfo.ppid;
+                        depth++;
+                    }
+                }
+
+                if (isRelated) {
+                    relatedPids.add(pid);
+                    foundNew = true;
+                }
             }
         }
     } catch (e) {
-        // /proc not accessible, return base PIDs
         return basePids;
     }
 
-    const result = Array.from(matchingPids);
+    const result = Array.from(relatedPids);
 
-    // Cache the result
-    processCache.set(appId, result);
-    processCacheTime = now;
+    // Cache the result with timestamp
+    processCache.set(appId, {
+        pids: result,
+        timestamp: now
+    });
 
     // Clear old cache entries
     if (processCache.size > 50) {
-        const firstKey = processCache.keys().next().value;
-        processCache.delete(firstKey);
+        let oldestKey = null;
+        let oldestTime = Infinity;
+        
+        for (let [key, value] of processCache.entries()) {
+            if (value.timestamp < oldestTime) {
+                oldestTime = value.timestamp;
+                oldestKey = key;
+            }
+        }
+        
+        if (oldestKey !== null) {
+            processCache.delete(oldestKey);
+        }
     }
 
-    return result.length > 0 ? result : basePids;
+    return result;
 }
 
 function getProcessMemory(pid) {
     try {
+        // Use PSS (Proportional Set Size) - most accurate for shared memory
+        const [smapsSuccess, smapsContents] = GLib.file_get_contents(`/proc/${pid}/smaps_rollup`);
+        if (smapsSuccess) {
+            const text = new TextDecoder('utf-8').decode(smapsContents);
+            // Match only "Pss:" at start of line, not "SwapPss:"
+            const pssMatch = text.match(/^Pss:\s+(\d+)\s+kB/m);
+            if (pssMatch) {
+                const pssValue = parseInt(pssMatch[1], 10);
+                if (pssValue > 0 && pssValue < 1000000000) {
+                    return pssValue;
+                }
+            }
+        }
+
+        // Fallback to VmRSS if PSS unavailable
         const [success, contents] = GLib.file_get_contents(`/proc/${pid}/status`);
         if (!success) return 0;
 
         const text = new TextDecoder('utf-8').decode(contents);
-        const vmRssMatch = text.match(/VmRSS:\s+(\d+)\s+kB/);
-        if (vmRssMatch) return parseInt(vmRssMatch[1], 10);
+        const vmRssMatch = text.match(/^VmRSS:\s+(\d+)\s+kB/m);
+        if (vmRssMatch) {
+            const vmRssValue = parseInt(vmRssMatch[1], 10);
+            if (vmRssValue > 0) return vmRssValue;
+        }
 
         return 0;
     } catch (e) {
@@ -131,7 +290,7 @@ function getProcessMemory(pid) {
 }
 
 function getAppMemory(app) {
-    const allPids = getAppMatchingProcesses(app);
+    const allPids = getAppRelatedProcesses(app);
     let totalMemoryKB = 0;
 
     for (let pid of allPids) {
@@ -189,7 +348,6 @@ export default class OverviewAppMemoryExtension extends Extension {
 
         // Clear caches on disable
         processCache.clear();
-        processCacheTime = 0;
     }
 
     _patchAppIcon() {
