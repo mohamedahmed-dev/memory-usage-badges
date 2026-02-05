@@ -63,51 +63,6 @@ function getParentPid(pid) {
     }
 }
 
-function getProcessCgroup(pid) {
-    try {
-        const [success, contents] = GLib.file_get_contents(`/proc/${pid}/cgroup`);
-        if (!success) return null;
-
-        const text = new TextDecoder('utf-8').decode(contents);
-        const lines = text.split('\n');
-
-        for (let line of lines) {
-            if (line.startsWith('0::')) {
-                return line.substring(3);
-            }
-        }
-
-        if (lines.length > 0 && lines[0].includes(':')) {
-            const parts = lines[0].split(':');
-            if (parts.length >= 3) return parts[2];
-        }
-
-        return null;
-    } catch (e) {
-        return null;
-    }
-}
-
-function getParentPid(pid) {
-    try {
-        const [success, contents] = GLib.file_get_contents(`/proc/${pid}/stat`);
-        if (!success) return null;
-
-        const text = new TextDecoder('utf-8').decode(contents);
-        const parts = text.split(')');
-
-        if (parts.length > 1) {
-            const fields = parts[1].trim().split(/\s+/);
-            const ppid = parseInt(fields[1], 10);
-            return ppid > 0 ? ppid : null;
-        }
-
-        return null;
-    } catch (e) {
-        return null;
-    }
-}
-
 function getProcessExePath(pid) {
     try {
         const file = GLib.file_new_for_path(`/proc/${pid}/exe`);
@@ -389,11 +344,6 @@ export default class OverviewAppMemoryExtension extends Extension {
             return;
         }
 
-        // Only update when overview is visible to save resources
-        if (!Main.overview.visible) {
-            return;
-        }
-
         this._isUpdating = true;
 
         // Build queue of apps to update
@@ -401,7 +351,7 @@ export default class OverviewAppMemoryExtension extends Extension {
         const runningApps = appSystem.get_running();
         this._updateQueue = Array.from(runningApps);
         this._updateQueueProcessing = false;
-this._appMemoryCache.clear();
+        this._appMemoryCache.clear();
 
         // Start processing queue in chunks
         this._processUpdateQueue();
